@@ -22,6 +22,7 @@
   const MAX_HP = 5000000;
   const ROUND_TIME = 90;
   const LIGHT_DURATION = 0.18;
+  const LIGHT_COOLDOWN = 0.1;
   const LIGHT_DAMAGE_MIN = 40000;
   const LIGHT_DAMAGE_MAX = 48000;
   const HEAVY_HIT_RANGE_X = 48;
@@ -34,7 +35,9 @@
   const PARRY_COOLDOWN = 13;
   const PERFECT_PARRY_COOLDOWN = 5;
   const BREAK_PARRY_COOLDOWN = 18;
-  const PARRY_WINDOW = 0.3;
+  const PARRY_WINDOW = 0.36; // 略微放宽普通防反窗口
+  const PARRY_LATE_GRACE = 0.22; // 受击后的短暂宽限：刚被打中时按空格可补判为完美防反
+  const PARRY_THREAT_BUFFER = 0.12; // 对正在接近的攻击增加少量预判距离
   const PARRY_EFFECT_DURATION = 0.34;
   const PARRY_DAMAGE_MIN = 10000;
   const PARRY_DAMAGE_MAX = 20000;
@@ -85,10 +88,12 @@
       parryEffectTime: 0,
       parryPerfect: false,
       breakParryTime: 0,
+      lastHitInfo: null,
       aiThink: 0.2,
       aiCharge: false,
 
       // 攻击动画
+      lightCooldown: 0,
       attackTime: 0,
       attackHitDone: false,
       attackDuration: LIGHT_DURATION,
@@ -416,6 +421,8 @@
     if (!defender || !attacker || attacker.hp <= 0) return;
 
     defender.parryTime = 0;
+    defender.hitstunTime = 0;
+    defender.lastHitInfo = null;
     defender.parryCooldown = PERFECT_PARRY_COOLDOWN;
     defender.parryEffectTime = PARRY_EFFECT_DURATION;
     defender.parryPerfect = true;
@@ -452,13 +459,109 @@
     return true;
   }
 
-  // 按下空格：开启 0.3 秒防反窗口，冷却 13 秒
+  // 判断对手是否有攻击会在当前防反窗口内到达。
+  // 受击僵直中若确实有重击即将命中，优先开启完美防反窗口，而不是误判为红色脱身。
+  function isIncomingThreatWithinParryWindow(defender) {
+    const attacker = defender === p1 ? p2 : p1;
+    if (!attacker || attacker.hp <= 0) return false;
+
+    const defenderCenterX = defender.x + defender.width / 2;
+    const attackerCenterX = attacker.x + attacker.width / 2;
+    const dx = defenderCenterX - attackerCenterX;
+    const verticalOverlap =
+      attacker.y < defender.y + defender.height &&
+      attacker.y + attacker.height > defender.y;
+
+    // 正在突进的重击：按剩余冲刺距离和防反窗口预测攻击是否会接近。
+    if (attacker.dash && verticalOverlap) {
+      const d = attacker.dash;
+      const towardDefender = dx * d.dir > 0;
+      if (towardDefender) {
+        const gap = d.dir > 0
+          ? defender.x - (attacker.x + attacker.width)
+          : attacker.x - (defender.x + defender.width);
+        const remaining = Math.max(0, d.distance - d.moved);
+        const reach = Math.min(remaining, d.speed * (PARRY_WINDOW + PARRY_THREAT_BUFFER))
+          + HEAVY_HIT_RANGE_X;
+        if (gap <= reach && gap >= -defender.width - HEAVY_HIT_RANGE_X) return true;
+      }
+    }
+
+    // 对手正在蓄重击且距离足够近：允许提前举盾等候释放。
+    if (attacker.chargingHeavy && verticalOverlap &&
+        dx * attacker.attackFacing > 0 && Math.abs(dx) <= 340) {
+      return true;
+    }
+
+    // 正在挥出的轻击已进入可命中距离。
+    if (attacker.attackTime > 0 && attacker.attackType === 'light' &&
+        lightAttackCanHit(attacker, defender)) {
+      return true;
+    }
+
+    // 飞行中的火球将在防反窗口内到达。
+    for (const ball of fireballs) {
+      if (ball.attacker !== attacker) continue;
+      const bx = (defenderCenterX - ball.x) * ball.dir;
+      const by = Math.abs((defender.y + defender.height / 2) - ball.y);
+      const maxX = FIREBALL_SPEED * (PARRY_WINDOW + PARRY_THREAT_BUFFER)
+        + defender.width / 2 + ball.r;
+      if (bx >= -ball.r && bx <= maxX && by <= defender.height / 2 + ball.r) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // 若按键刚好晚于受击结算一帧，在很短的宽限内撤销刚才那次受击，再按完美防反处理。
+  function tryLatePerfectParry(defender) {
+    const hit = defender && defender.lastHitInfo;
+    if (!hit || hit.timeLeft <= 0 || !hit.attacker || hit.attacker.hp <= 0) return false;
+
+    defender.hp = hit.hpBefore;
+    defender.whiteHp = hit.whiteHpBefore;
+    defender.vx = hit.vxBefore;
+    defender.vy = hit.vyBefore;
+    defender.onGround = hit.onGroundBefore;
+    defender.hitstunTime = 0;
+    defender.flashTime = hit.flashTimeBefore;
+    defender.chargingHeavy = hit.chargingHeavyBefore;
+    defender.chargeTime = hit.chargeTimeBefore;
+    defender.dash = hit.dashBefore;
+    defender.lastHitInfo = null;
+
+    if (hit.damageText) {
+      const textIndex = damageTexts.indexOf(hit.damageText);
+      if (textIndex >= 0) damageTexts.splice(textIndex, 1);
+    }
+    if (hit.hitParticles && hit.hitParticles.length) {
+      const hitParticleSet = new Set(hit.hitParticles);
+      particles = particles.filter(particle => !hitParticleSet.has(particle));
+    }
+
+    performPerfectParry(defender, hit.attacker, hit.incomingDir);
+    return true;
+  }
+
+  // 按下空格：开启加宽后的防反窗口；僵直中若有即将命中的攻击则优先尝试完美防反。
   function startParry() {
     if (!gameStarted || gameOver || p1.hp <= 0 || p1.parryCooldown > 0 ||
         p1.grabbed || p1.dash || p1.chargingHeavy) return;
 
-    // 僵直中按空格：脱困防反，红色护罩，仅造成水平击退；冷却增加到 18 秒。
+    // 僵直中按空格：若对手攻击即将到达，优先开普通防反窗口。
+    // 若刚好晚于受击结算，则在短暂宽限内回滚该次受击并补判完美防反。
     if (p1.hitstunTime > 0) {
+      if (isIncomingThreatWithinParryWindow(p1)) {
+        p1.parryCooldown = PARRY_COOLDOWN;
+        p1.parryTime = PARRY_WINDOW;
+        p1.parryEffectTime = PARRY_WINDOW;
+        p1.parryPerfect = false;
+        return;
+      }
+      if (tryLatePerfectParry(p1)) return;
+
+      // 没有即将命中的攻击且已错过完美防反宽限，才执行红色脱身。
       p1.parryCooldown = BREAK_PARRY_COOLDOWN;
       p1.hitstunTime = 0;
       p1.breakParryTime = 0.34;
@@ -495,6 +598,22 @@
     // 命中瞬间恰好处于防反窗口：取消原伤害，转为完美防反
     if (!opt.ignoreParry && tryPerfectParry(target, attacker, incomingDir)) return 0;
 
+    // 记录受击前状态。若玩家在攻击命中后极短时间内按下空格，可回滚该次受击。
+    const stateBeforeHit = {
+      hpBefore: target.hp,
+      whiteHpBefore: target.whiteHp,
+      vxBefore: target.vx,
+      vyBefore: target.vy,
+      onGroundBefore: target.onGround,
+      hitstunBefore: target.hitstunTime,
+      flashTimeBefore: target.flashTime,
+      chargingHeavyBefore: target.chargingHeavy,
+      chargeTimeBefore: target.chargeTime,
+      dashBefore: target.dash
+    };
+    // 新命中覆盖旧的“刚受击”宽限记录，避免回滚时漏掉后续伤害。
+    target.lastHitInfo = null;
+
     const critical = opt.noCritical ? false : Math.random() < CRITICAL_RATE;
     const rawDamage = critical ? baseDamage * 2 : baseDamage;
     // 蹲防拥有霸体，并将受到的最终伤害（含暴击）降低 20%。
@@ -509,17 +628,20 @@
     const cx = target.x + target.width / 2;
     const cy = target.y + target.height / 2;
 
-    damageTexts.push({
+    const hitDamageText = {
       x: cx,
       y: target.y - 13,
       text: realDamage.toLocaleString(),
       color: critical ? '#ff3030' : '#ffffff',
       life: 0.85,
       maxLife: 0.85
-    });
+    };
+    damageTexts.push(hitDamageText);
 
     target.flashTime = 0.05;
+    const particleStart = particles.length;
     spawnHitParticles(cx, cy);
+    const hitParticles = particles.slice(particleStart);
 
     const dir = opt.dir !== undefined
       ? opt.dir
@@ -538,6 +660,17 @@
       target.chargingHeavy = false;
       target.chargeTime = 0;
       target.dash = null;
+
+      if (!crouching) {
+        target.lastHitInfo = {
+          ...stateBeforeHit,
+          attacker,
+          incomingDir: dir,
+          timeLeft: PARRY_LATE_GRACE,
+          damageText: hitDamageText,
+          hitParticles
+        };
+      }
     }
 
     if (opt.attackerPush) {
@@ -552,8 +685,10 @@
 
   // ===== 轻击：原地挥出竖向圆弧，无冷却；命中在 updateCombat 中统一判定 =====
   function lightAttackFor(p) {
-    if (gameOver || p.hp <= 0 || isCrouching(p) || p.hitstunTime > 0 || p.grabbed || p.dash) return;
-
+    if (gameOver || p.hp <= 0 || isCrouching(p) ||
+    p.hitstunTime > 0 || p.grabbed || p.dash ||
+    p.lightCooldown > 0) return;
+    p.lightCooldown = LIGHT_COOLDOWN;
     p.attackTime = LIGHT_DURATION;
     p.attackDuration = LIGHT_DURATION;
     p.attackType = 'light';
@@ -863,6 +998,7 @@
     for (const p of [p1, p2]) {
       p.heavyCooldown = Math.max(0, p.heavyCooldown - dt);
       p.ultimateCooldown = Math.max(0, p.ultimateCooldown - dt);
+      p.lightCooldown = Math.max(0, p.lightCooldown - dt);
       if (p.chargingHeavy) p.chargeTime = Math.min(HEAVY_MAX_CHARGE, p.chargeTime + dt);
     }
 
@@ -973,6 +1109,11 @@
         if (p.attackTime > 0) {
           p.attackTime = Math.max(0, p.attackTime - worldDt);
         }
+      }
+
+      if (p.lastHitInfo && worldDt > 0) {
+        p.lastHitInfo.timeLeft = Math.max(0, p.lastHitInfo.timeLeft - worldDt);
+        if (p.lastHitInfo.timeLeft <= 0) p.lastHitInfo = null;
       }
 
       p.flashTime = Math.max(0, p.flashTime - realDt);
@@ -1270,7 +1411,7 @@
       ctx.arc(0, 0, 23 + progress * 22, 0, Math.PI * 2);
       ctx.fill();
     } else {
-      // 0.3 秒白色防护罩
+      // 防反窗口内的白色防护罩
       const progress = Math.max(0, p.parryTime / PARRY_WINDOW);
       ctx.globalAlpha = 0.35 + 0.65 * progress;
       ctx.fillStyle = 'rgba(255,255,255,0.22)';
@@ -1519,7 +1660,7 @@
     const bar = document.getElementById('skillBar');
     if (bar) bar.style.display = gameStarted ? 'flex' : 'none';
     const entries = [
-      ['skillLight', 0, '无CD'],
+      ['skillLight', p1 ? p1.lightCooldown : 0, '0.1s'],
       ['skillHeavy', p1 ? p1.heavyCooldown : 0, '1.5s'],
       ['skillUltimate', p1 ? p1.ultimateCooldown : 0, '45s'],
       ['skillParry', p1 ? p1.parryCooldown : 0, '13s']
@@ -1528,7 +1669,7 @@
       const el = document.getElementById(id);
       if (!el) continue;
       if (id === 'skillLight') {
-        el.textContent = '无CD';
+        el.textContent = '就绪';
         el.classList.add('ready');
         el.classList.remove('cooling');
       } else if (remaining <= 0.001) {
