@@ -103,10 +103,6 @@
       vy: 0,
       vx: 0,
       onGround: true,
-
-      // 已经使用的跳跃次数：0=未跳，1=一段跳，2=二段跳
-      jumpsUsed: 0,
-
       facing: isLeft ? 1 : -1,
       color,
       lightColor,
@@ -237,32 +233,18 @@
     clampX(p);
   }
 
-// ===== 跳跃系统：支持二段跳 =====
   function tryJump(p) {
+    if (!p.onGround || p.hitstunTime > 0 || p.grabbed || p.dash) return;
 
-      // 受击僵直、被抓取、冲刺期间不能跳跃
-      if (p.hitstunTime > 0 || p.grabbed || p.dash) return;
+    if (p.crouching) {
+      p.crouching = false;
+      setPlayerSize(p, p.normalW, p.normalH);
+    }
 
-      // 最多只能跳两次
-      if (p.jumpsUsed >= 2) return;
-
-      // 如果不在地面，而且一次跳跃都没使用过，
-      // 说明角色是被其他攻击击飞的，不允许凭空获得一次跳跃
-      if (!p.onGround && p.jumpsUsed === 0) return;
-
-      // 起跳时取消蹲下
-      if (p.crouching) {
-          p.crouching = false;
-          setPlayerSize(p, p.normalW, p.normalH);
-      }
-
-      // 一段跳和二段跳使用相同的初速度
-      p.vy = -JUMP_SPEED;
-      p.onGround = false;
-
-      // 记录已经使用的跳跃次数
-      p.jumpsUsed++;
+    p.vy = -JUMP_SPEED;
+    p.onGround = false;
   }
+
   // ===== 玩家移动与受击后的物理 =====
   function updatePlayer(p, dt, allowInput) {
     if (p.grabbed) return;
@@ -319,14 +301,11 @@
     p.y += p.vy * dt;
 
     if (p.y + p.height >= GROUND_Y) {
-        p.y = GROUND_Y - p.height;
-        p.vy = 0;
-        p.onGround = true;
-
-        // 落地后重新获得两次跳跃机会
-        p.jumpsUsed = 0;
+      p.y = GROUND_Y - p.height;
+      p.vy = 0;
+      p.onGround = true;
     } else {
-        p.onGround = false;
+      p.onGround = false;
     }
   }
 
