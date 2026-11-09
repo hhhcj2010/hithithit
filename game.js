@@ -22,12 +22,17 @@
   const MAX_HP = 5000000;
   const ROUND_TIME = 90;
   const LIGHT_DURATION = 0.18;
+  const LIGHT_COOLDOWN = 0.1;
+  const HEAVY_HIT_RANGE_X = 48;
+  const COUNTER_SLASH_DURATION = 0.3;
   const HEAVY_COOLDOWN = 1.5;
   const HEAVY_MAX_CHARGE = 0.25;
   const ULTIMATE_COOLDOWN = 45;
   const FIREBALL_SPEED = MOVE_SPEED * 1.2;
   const CRITICAL_RATE = 0.1;
   const PARRY_COOLDOWN = 13;
+  const PERFECT_PARRY_COOLDOWN = 5;
+  const BREAK_PARRY_COOLDOWN = 18;
   const PARRY_WINDOW = 0.3;
   const PARRY_EFFECT_DURATION = 0.34;
   const PARRY_DAMAGE_MIN = 10000;
@@ -82,6 +87,7 @@
       aiCharge: false,
 
       // 攻击动画
+      lightCooldown: 0,
       attackTime: 0,
       attackDuration: LIGHT_DURATION,
       attackType: 'light',
@@ -110,6 +116,7 @@
   let particles = [];
   let dashTrails = [];
   let fireballs = [];
+  let goldSlashes = [];
 
   let hitStopTime = 0;
   let cameraShakeTime = 0;
@@ -138,6 +145,7 @@
     particles = [];
     dashTrails = [];
     fireballs = [];
+    goldSlashes = [];
 
     hitStopTime = 0;
     cameraShakeTime = 0;
@@ -187,6 +195,11 @@
     if (allowInput && p.hitstunTime <= 0 && !p.dash) {
       const dir = (keys['d'] ? 1 : 0) - (keys['a'] ? 1 : 0);
       const wantCrouch = p.onGround && !!keys['s'];
+
+      if (wantCrouch && !p.crouching && p.chargingHeavy) {
+        p.chargingHeavy = false;
+        p.chargeTime = 0;
+      }
 
       if (wantCrouch !== p.crouching) {
         p.crouching = wantCrouch;
@@ -313,6 +326,11 @@
     }
   }
 
+  function isCrouching(p) {
+    // S 按下后的同一帧也立即视为蹲防，避免按键时序造成攻击漏拦。
+    return !!(p.crouching || (p === p1 && p.onGround && keys['s']));
+  }
+
   function randomInt(l, r) {
     return Math.floor(Math.random() * (r - l + 1)) + l;
   }
@@ -353,6 +371,16 @@
     }
   }
 
+  // 防反斩：在目标身上生成一条随机角度的金色斩击。
+  function spawnGoldSlash(x, y) {
+    goldSlashes.push({
+      x, y,
+      angle: Math.random() * Math.PI,
+      life: COUNTER_SLASH_DURATION,
+      maxLife: COUNTER_SLASH_DURATION
+    });
+  }
+
   function triggerImpact(frames, shakePower) {
     hitStopTime = Math.max(hitStopTime, frames / 60);
     cameraShakeTime = 0.15;
@@ -364,6 +392,7 @@
     if (!defender || !attacker || attacker.hp <= 0) return;
 
     defender.parryTime = 0;
+    defender.parryCooldown = PERFECT_PARRY_COOLDOWN;
     defender.parryEffectTime = PARRY_EFFECT_DURATION;
     defender.parryPerfect = true;
 
@@ -404,10 +433,9 @@
     if (!gameStarted || gameOver || p1.hp <= 0 || p1.parryCooldown > 0 ||
         p1.grabbed || p1.dash || p1.chargingHeavy) return;
 
-    p1.parryCooldown = PARRY_COOLDOWN;
-
-    // 僵直中按空格：脱困防反，红色护罩，仅造成水平击退
+    // 僵直中按空格：脱困防反，红色护罩，仅造成水平击退；冷却增加到 18 秒。
     if (p1.hitstunTime > 0) {
+      p1.parryCooldown = BREAK_PARRY_COOLDOWN;
       p1.hitstunTime = 0;
       p1.breakParryTime = 0.34;
       p1.parryEffectTime = 0.34;
@@ -426,6 +454,7 @@
       return;
     }
 
+    p1.parryCooldown = PARRY_COOLDOWN;
     p1.parryTime = PARRY_WINDOW;
     p1.parryEffectTime = PARRY_WINDOW;
     p1.parryPerfect = false;
@@ -443,7 +472,9 @@
     if (!opt.ignoreParry && tryPerfectParry(target, attacker, incomingDir)) return 0;
 
     const critical = opt.noCritical ? false : Math.random() < CRITICAL_RATE;
-    const damage = critical ? baseDamage * 2 : baseDamage;
+    const rawDamage = critical ? baseDamage * 2 : baseDamage;
+    // 蹲防拥有霸体，并将受到的最终伤害（含暴击）降低 20%。
+    const damage = target.crouching ? Math.round(rawDamage * 0.8) : rawDamage;
     const oldHp = target.hp;
     const realDamage = Math.min(oldHp, damage);
 
@@ -472,7 +503,10 @@
     if (opt.knockback > 0) {
       target.vx = dir * opt.knockback;
       target.vy = -opt.launch;
-      target.hitstunTime = Math.max(target.hitstunTime, opt.stun || 0.12);
+      // 蹲防期间保留击退/击飞物理效果，但不会增加受击僵直。
+      if (!target.crouching) {
+        target.hitstunTime = Math.max(target.hitstunTime, opt.stun || 0.12);
+      }
       target.onGround = false;
 
       // 受击僵直期间取消蓄力和突进，不能继续操作
@@ -494,8 +528,9 @@
   // ===== 轻击：原地挥出竖向圆弧 =====
   function lightAttackFor(p) {
     const target = p === p1 ? p2 : p1;
-    if (gameOver || p.hp <= 0 || p.hitstunTime > 0 || p.grabbed || p.dash) return;
+    if (gameOver || p.hp <= 0 || isCrouching(p) || p.hitstunTime > 0 || p.grabbed || p.dash || p.lightCooldown > 0) return;
 
+    p.lightCooldown = LIGHT_COOLDOWN;
     p.attackTime = LIGHT_DURATION;
     p.attackDuration = LIGHT_DURATION;
     p.attackType = 'light';
@@ -509,7 +544,7 @@
 
     applyDamage(p, target, randomInt(50000, 60000), {
       dir: p.attackFacing, knockback: 300, launch: LIGHT_LAUNCH,
-      stun: 0.1, attackerPush: 8, hitStop: 3, shake: 4
+      stun: 0.17, attackerPush: 8, hitStop: 3, shake: 4
     });
   }
 
@@ -517,7 +552,7 @@
 
   // ===== 重击：按住 K 蓄力，松开后突进 =====
   function startHeavyChargeFor(p) {
-    if (gameOver || p.hp <= 0 || p.heavyCooldown > 0 || p.hitstunTime > 0 || p.grabbed || p.dash) return;
+    if (gameOver || p.hp <= 0 || isCrouching(p) || p.heavyCooldown > 0 || p.hitstunTime > 0 || p.grabbed || p.dash) return;
     p.chargingHeavy = true;
     p.chargeTime = 0;
     p.attackFacing = p.facing;
@@ -528,7 +563,7 @@
   function releaseHeavyChargeFor(p) {
     if (!p.chargingHeavy) return;
     p.chargingHeavy = false;
-    if (gameOver || p.hp <= 0) { p.chargeTime = 0; return; }
+    if (gameOver || p.hp <= 0 || isCrouching(p)) { p.chargeTime = 0; return; }
     const charge = Math.min(1, p.chargeTime / HEAVY_MAX_CHARGE);
     p.chargeTime = 0;
     p.heavyCooldown = HEAVY_COOLDOWN;
@@ -543,21 +578,32 @@
 
   function releaseHeavyCharge() { releaseHeavyChargeFor(p1); }
 
-  // 完美防反后的第四种追击：快速突进斩。
+  // 完美防反后的第四种追击：随机方向金色斩击，直接命中敌人。
   function parryFollowupAttackFor(p) {
     const target = p === p1 ? p2 : p1;
-    if (gameOver || p.hp <= 0 || p.hitstunTime > 0 || p.grabbed || p.dash) return;
-    p.attackTime = 0.24;
-    p.attackDuration = 0.24;
+    if (gameOver || p.hp <= 0 || isCrouching(p) || p.hitstunTime > 0 || p.grabbed || p.dash || target.hp <= 0) return;
+
+    const attackerX = p.x + p.width / 2;
+    const targetX = target.x + target.width / 2;
+    const dir = targetX >= attackerX ? 1 : -1;
+    const targetXCenter = targetX;
+    const targetYCenter = target.y + target.height / 2;
+
+    // 不再检查距离、朝向或高度：防反斩必定锁定并命中对手。
+    p.attackTime = 0; // 取消可能残留的普通攻击特效，只显示目标身上的金色斩击。
     p.attackType = 'counter';
-    p.attackFacing = p.facing;
-    const dx = (target.x + target.width / 2) - (p.x + p.width / 2);
-    if (dx * p.attackFacing <= 0 || Math.abs(dx) > 190) return;
-    const vertical = p.y < target.y + target.height && p.y + p.height > target.y;
-    if (!vertical) return;
-    applyDamage(p, target, randomInt(80000, 100000), {
-      dir: p.attackFacing, knockback: 440, launch: 260, stun: 0.2,
-      attackerPush: 18, hitStop: 6, shake: 7
+    p.attackFacing = dir;
+    spawnGoldSlash(targetXCenter, targetYCenter);
+
+    applyDamage(p, target, randomInt(100000, 150000), {
+      dir,
+      knockback: 560,
+      launch: HEAVY_LAUNCH,
+      stun: 1.5,
+      attackerPush: 4,
+      hitStop: 8,
+      shake: 8,
+      ignoreParry: true
     });
   }
 
@@ -595,7 +641,7 @@
 
   // ===== 大招：发射火球 =====
   function ultimateAttackFor(p) {
-    if (gameOver || p.hp <= 0 || p.ultimateCooldown > 0 || p.hitstunTime > 0 || p.grabbed || p.dash || p.chargingHeavy) return;
+    if (gameOver || p.hp <= 0 || isCrouching(p) || p.ultimateCooldown > 0 || p.hitstunTime > 0 || p.grabbed || p.dash || p.chargingHeavy) return;
     p.ultimateCooldown = ULTIMATE_COOLDOWN;
     p.attackFacing = p.facing;
     fireballs.push({attacker: p, x: p.x + p.width / 2 + p.facing * 30, y: p.y + p.height * 0.48, vx: p.facing * FIREBALL_SPEED, dir: p.facing, r: 13, life: 2.5});
@@ -664,14 +710,15 @@
     }
 
     // 近距离轻击
-    if (dist <= 125 && Math.random() < cfg.aggression) {
+    if (dist <= 125 && p2.lightCooldown <= 0 && Math.random() < cfg.aggression) {
+      p2.lightCooldown = LIGHT_COOLDOWN;
       p2.attackTime = LIGHT_DURATION;
       p2.attackDuration = LIGHT_DURATION;
       p2.attackType = 'light';
       p2.attackFacing = dir;
       const vertical = p2.y < p1.y + p1.height && p2.y + p2.height > p1.y;
       if (vertical) applyDamage(p2, p1, randomInt(50000, 60000), {
-        dir, knockback: 300, launch: LIGHT_LAUNCH, stun: 0.1,
+        dir, knockback: 300, launch: LIGHT_LAUNCH, stun: 0.17,
         attackerPush: 8, hitStop: 3, shake: 4
       });
       return;
@@ -693,6 +740,7 @@
     for (const p of [p1, p2]) {
       p.parryCooldown = Math.max(0, p.parryCooldown - dt);
       p.parryTime = Math.max(0, p.parryTime - dt);
+      p.lightCooldown = Math.max(0, p.lightCooldown - dt);
     }
 
     for (const p of [p1, p2]) {
@@ -713,7 +761,13 @@
       const moved = Math.abs(attacker.x - oldX);
       d.moved += moved;
       dashTrails.push({x: attacker.x + attacker.width / 2 - d.dir * 10, y: attacker.y + attacker.height * 0.55, dir: d.dir, life: 0.34, maxLife: 0.34});
-      if (rectsOverlap(attacker, target) && !d.damageDone) {
+      const heavyHitbox = {
+        x: attacker.x + (d.dir > 0 ? 0 : -HEAVY_HIT_RANGE_X),
+        y: attacker.y,
+        width: attacker.width + HEAVY_HIT_RANGE_X,
+        height: attacker.height
+      };
+      if (rectsOverlap(heavyHitbox, target) && !d.damageDone) {
         d.damageDone = true;
         applyDamage(attacker, target, randomInt(100000, 120000), {dir: d.dir, knockback: 560, launch: HEAVY_LAUNCH, stun: 0.25, attackerPush: 4, hitStop: 10, shake: 8});
         attacker.dash = null;
@@ -822,6 +876,9 @@
 
     for (const t of dashTrails) t.life -= realDt;
     dashTrails = dashTrails.filter(t => t.life > 0);
+
+    for (const s of goldSlashes) s.life -= realDt;
+    goldSlashes = goldSlashes.filter(s => s.life > 0);
 
     cameraShakeTime = Math.max(0, cameraShakeTime - realDt);
     if (cameraShakeTime <= 0) cameraShakePower = 0;
@@ -1125,6 +1182,40 @@
     }
   }
 
+  // 在敌人身上绘制一条随机角度、带金色辉光的斩击。
+  function drawGoldSlashes() {
+    for (const s of goldSlashes) {
+      const progress = 1 - s.life / s.maxLife;
+      const alpha = Math.max(0, 1 - progress);
+      const halfLength = 62 + progress * 8;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.angle);
+      ctx.lineCap = 'round';
+
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 13 * (1 - progress * 0.55);
+      ctx.shadowColor = '#facc15';
+      ctx.shadowBlur = 25;
+      ctx.beginPath();
+      ctx.moveTo(-halfLength, -5);
+      ctx.lineTo(halfLength, 5);
+      ctx.stroke();
+
+      ctx.strokeStyle = '#fff7c2';
+      ctx.lineWidth = 4 * (1 - progress * 0.45);
+      ctx.shadowColor = '#fff1a6';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(-halfLength + 5, -5);
+      ctx.lineTo(halfLength - 5, 5);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
   function drawChargeEffect() {
     for (const p of [p1, p2]) {
     if (!p.chargingHeavy) continue;
@@ -1262,7 +1353,7 @@
     const bar = document.getElementById('skillBar');
     if (bar) bar.style.display = gameStarted ? 'flex' : 'none';
     const entries = [
-      ['skillLight', 0, '无CD'],
+      ['skillLight', p1 ? p1.lightCooldown : 0, '0.1s'],
       ['skillHeavy', p1 ? p1.heavyCooldown : 0, '1.5s'],
       ['skillUltimate', p1 ? p1.ultimateCooldown : 0, '45s'],
       ['skillParry', p1 ? p1.parryCooldown : 0, '13s']
@@ -1270,9 +1361,7 @@
     for (const [id, remaining, readyText] of entries) {
       const el = document.getElementById(id);
       if (!el) continue;
-      if (id === 'skillLight') {
-        el.textContent = readyText;
-      } else if (remaining <= 0.001) {
+      if (remaining <= 0.001) {
         el.textContent = '就绪';
         el.classList.add('ready');
         el.classList.remove('cooling');
@@ -1416,6 +1505,7 @@
     drawParryEffect(p2);
     drawAttackEffect(p2);
     drawAttackEffect(p1);
+    drawGoldSlashes();
     drawChargeEffect();
     drawParticles();
     drawDamageTexts();
